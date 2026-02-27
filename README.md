@@ -67,6 +67,10 @@ max_bytes = 10485760
 backup_count = 5
 ```
 
+## Provisioning Agent
+
+For a full reference of supported tools, parameters, and example prompts see the [Provisioning Agent README](src/provisioning_agent/README.md).
+
 ## Usage
 
 ### Starting the Agent

@@ -1,5 +1,6 @@
 """Common utility functions for agent configuration and MCP setup."""
 
+import asyncio
 import configparser
 import json
 import logging
@@ -12,6 +13,22 @@ import httpx
 from langchain_core.tools import StructuredTool
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
+
+# Global semaphore to enforce sequential tool execution
+# This ensures only one tool executes at a time across all tool instances
+_TOOL_EXECUTION_SEMAPHORE = None
+
+
+def get_tool_execution_semaphore():
+    """Get or create the global tool execution semaphore.
+
+    This semaphore ensures that only one tool can execute at a time,
+    preventing concurrent tool calls that would cause SSE connection issues.
+    """
+    global _TOOL_EXECUTION_SEMAPHORE
+    if _TOOL_EXECUTION_SEMAPHORE is None:
+        _TOOL_EXECUTION_SEMAPHORE = asyncio.Semaphore(1)
+    return _TOOL_EXECUTION_SEMAPHORE
 
 
 def setup_logging(
@@ -45,6 +62,11 @@ def setup_logging(
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level_value)
     root_logger.handlers.clear()
+
+    # Suppress noisy third-party loggers: use the configured level but no lower than WARNING
+    third_party_level = max(log_level_value, logging.WARNING)
+    logging.getLogger("httpx").setLevel(third_party_level)
+    logging.getLogger("httpcore").setLevel(third_party_level)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
@@ -385,42 +407,54 @@ def create_langchain_tool_with_confirmation_simple(tool_name: str, mcp_client: M
     logger = logging.getLogger(__name__)
 
     async def tool_func(**kwargs) -> str:
-        """Execute MCP tool with human confirmation requirement."""
+        """Execute MCP tool with human confirmation requirement.
+
+        Uses a global semaphore to ensure sequential execution of all tools,
+        preventing concurrent tool calls that would cause SSE connection issues.
+        """
         if mcp_client is None:
             return f"Error: MCP client not initialized for tool {tool_name}"
 
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        print(f"\n{'=' * 70}")
-        print(f"CONFIRMATION REQUIRED: {tool_name}")
-        print(f"{'=' * 70}")
-        print("Arguments:")
-        for key, value in filtered_kwargs.items():
-            print(f"  {key}: {value}")
-        print(f"{'=' * 70}")
 
-        approval = interrupt(
-            {
-                "type": "human_confirmation",
-                "tool_name": tool_name,
-                "arguments": filtered_kwargs,
-                "message": f"Do you approve execution of {tool_name}?",
-            }
-        )
+        # Acquire semaphore to ensure sequential execution
+        semaphore = get_tool_execution_semaphore()
+        async with semaphore:
+            logger.debug(f"[SEQUENTIAL] Acquired execution lock for {tool_name}")
 
-        if approval is None or not approval.get("approved", False):
-            return json.dumps({"status": "cancelled", "message": f"Operation {tool_name} cancelled by user"})
+            print(f"\n{'=' * 70}")
+            print(f"CONFIRMATION REQUIRED: {tool_name}")
+            print(f"{'=' * 70}")
+            print("Arguments:")
+            for key, value in filtered_kwargs.items():
+                print(f"  {key}: {value}")
+            print(f"{'=' * 70}")
 
-        logger.info(f"Approved. Calling {tool_name} with args: {filtered_kwargs}")
-        try:
-            result = await mcp_client.call_tool(tool_name, filtered_kwargs)
-            logger.debug(f"Result from {tool_name} (type: {type(result)})")
-            logger.debug(f"Full result: {json.dumps(result, indent=2)}")
+            approval = interrupt(
+                {
+                    "type": "human_confirmation",
+                    "tool_name": tool_name,
+                    "arguments": filtered_kwargs,
+                    "message": f"Do you approve execution of {tool_name}?",
+                }
+            )
 
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            error_msg = f"Error executing {tool_name}: {str(e)}"
-            logger.error(error_msg)
-            return json.dumps({"status": "error", "message": error_msg})
+            if approval is None or not approval.get("approved", False):
+                logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (cancelled)")
+                return json.dumps({"status": "cancelled", "message": f"Operation {tool_name} cancelled by user"})
+
+            logger.info(f"Approved. Calling {tool_name} with args: {filtered_kwargs}")
+            try:
+                result = await mcp_client.call_tool(tool_name, filtered_kwargs)
+                logger.debug(f"Result from {tool_name} (type: {type(result)})")
+                logger.debug(f"Full result: {json.dumps(result, indent=2)}")
+                logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (success)")
+                return json.dumps(result, indent=2)
+            except Exception as e:
+                error_msg = f"Error executing {tool_name}: {str(e)}"
+                logger.error(error_msg)
+                logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (error)")
+                return json.dumps({"status": "error", "message": error_msg})
 
     tool = StructuredTool(name=tool_name, description=tool_description, args_schema=InputModel, coroutine=tool_func)
 
@@ -498,25 +532,34 @@ def create_langchain_tool_no_confirmation_simple(tool_name: str, mcp_client: MCP
     logger = logging.getLogger(__name__)
 
     async def tool_func(**kwargs) -> str:
-        """Execute MCP tool without confirmation."""
+        """Execute MCP tool without confirmation.
+
+        Uses a global semaphore to ensure sequential execution of all tools,
+        preventing concurrent tool calls that would cause SSE connection issues.
+        """
         if mcp_client is None:
             return f"Error: MCP client not initialized for tool {tool_name}"
 
         filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
-        logger.info(f"Calling {tool_name} with args: {filtered_kwargs}")
-        try:
-            import json
+        # Acquire semaphore to ensure sequential execution
+        semaphore = get_tool_execution_semaphore()
+        async with semaphore:
+            logger.debug(f"[SEQUENTIAL] Acquired execution lock for {tool_name}")
+            logger.debug(f"Calling {tool_name} with args: {filtered_kwargs}")
+            try:
+                import json
 
-            result = await mcp_client.call_tool(tool_name, filtered_kwargs)
-            logger.debug(f"Result from {tool_name} (type: {type(result)})")
-            logger.debug(f"Full result: {json.dumps(result, indent=2)}")
-
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            error_msg = f"Error executing {tool_name}: {str(e)}"
-            logger.error(error_msg)
-            return error_msg
+                result = await mcp_client.call_tool(tool_name, filtered_kwargs)
+                logger.debug(f"Result from {tool_name} (type: {type(result)})")
+                logger.debug(f"Full result: {json.dumps(result, indent=2)}")
+                logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (success)")
+                return json.dumps(result, indent=2)
+            except Exception as e:
+                error_msg = f"Error executing {tool_name}: {str(e)}"
+                logger.error(error_msg)
+                logger.debug(f"[SEQUENTIAL] Released execution lock for {tool_name} (error)")
+                return error_msg
 
     tool = StructuredTool(name=tool_name, description=tool_description, args_schema=InputModel, coroutine=tool_func)
 

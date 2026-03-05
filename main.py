@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+import logging
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command
 
 from src.provisioning_agent.agent import ProvisioningAgent
+
+logger = logging.getLogger(__name__)
 
 
 def get_interrupt_value(interrupt_list):
@@ -69,12 +72,11 @@ def display_results(event):
         msg_type = type(msg).__name__
 
         if msg_type == "ToolMessage":
-            print("\n[Tool Result]:")
             try:
                 content = json.loads(msg.content) if isinstance(msg.content, str) else msg.content
-                print(json.dumps(content, indent=2))
+                logger.debug(f"[Tool Result] {msg.name}:\n{json.dumps(content, indent=2)}")
             except (json.JSONDecodeError, TypeError):
-                print(msg.content)
+                logger.debug(f"[Tool Result] {msg.name}:\n{msg.content}")
 
         elif msg_type == "AIMessage" and hasattr(msg, "content") and msg.content:
             is_last_ai = all(type(messages[j]).__name__ != "AIMessage" for j in range(i + 1, len(messages)))
